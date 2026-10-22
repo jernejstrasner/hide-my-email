@@ -12,10 +12,13 @@ const exec = promisify(execFile);
  * trigger the 2FA push before the code can be submitted).
  *
  * Flow per command run (fresh Node process):
+ *   0. authorize/signin GET (OAuth prelude, sets the aasp cookie on idmsa)
  *   1. signin/init + signin/complete  (SRP-6a, GSA mode)  ─ uses a stored trust
  *      token so 2FA is skipped for ~30 days
  *   2. if 409 → 2FA: trigger push (PUT) → user enters code → verify → trust
- *   3. accountLogin → fresh iCloud cookies + webservices (incl. premiummailsettings)
+ *   3. accountLogin (with the webapp's client query params) → fresh iCloud
+ *      cookies — the full web-session set incl. X-APPLE-WEBAUTH-TOKEN, which
+ *      the Hide My Email service requires — + webservices (premiummailsettings)
  *
  * Because we re-auth each run from the trust token, the iCloud session cookies
  * are always freshly minted — no more cookie expiry to manage by hand.
@@ -49,6 +52,13 @@ const ICLOUD_ORIGIN = CHINA
 
 const USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:103.0) Gecko/20100101 Firefox/103.0";
+
+// The icloud.com web app identifies itself with these build numbers in query
+// parameters on setup/ws and premiummailsettings calls; accountLogin only
+// returns the full web-session cookie set (incl. X-APPLE-WEBAUTH-TOKEN, which
+// the Hide My Email service requires) when they are present.
+// Value observed from the current web client (2638Build27, Oct 2026).
+const WEBAPP_BUILD = "2638Build27";
 
 const DEFAULT_HEADERS: Record<string, string> = {
   "User-Agent": USER_AGENT,
@@ -173,6 +183,8 @@ interface Session {
   trustToken?: string;
   cookies: string[];
   webservices?: Record<string, { url: string; status: string }>;
+  dsid?: string;
+  clientId?: string;
 }
 
 const session: Session = { phase: "idle", cookies: [] };
@@ -270,6 +282,8 @@ async function loadSessionCache(): Promise<boolean> {
     const c = JSON.parse(raw) as {
       cookies: string[];
       webservices: Session["webservices"];
+      dsid?: string;
+      clientId?: string;
       ts: number;
     };
     if (!c.cookies?.length || !c.webservices?.premiummailsettings?.url)
@@ -277,6 +291,8 @@ async function loadSessionCache(): Promise<boolean> {
     if (Date.now() - c.ts > SESSION_TTL_MS) return false;
     session.cookies = c.cookies;
     session.webservices = c.webservices;
+    session.dsid = c.dsid;
+    session.clientId = c.clientId;
     session.phase = "ready";
     return true;
   } catch {
@@ -290,6 +306,8 @@ async function saveSessionCache(): Promise<void> {
     JSON.stringify({
       cookies: session.cookies,
       webservices: session.webservices,
+      dsid: session.dsid,
+      clientId: session.clientId,
       ts: Date.now(),
     }),
   );
@@ -308,6 +326,12 @@ function setCookiesFrom(res: Response) {
   return set;
 }
 
+/** Cookie header value: browsers send only name=value pairs back — never the
+ *  Domain/Path/Secure attributes from Set-Cookie. */
+function cookieHeader(): string {
+  return session.cookies.map((c) => c.split(";")[0].trim()).join("; ");
+}
+
 function captureSecrets(res: Response) {
   const sessionToken = res.headers.get("X-Apple-Session-Token");
   if (sessionToken) {
@@ -316,10 +340,7 @@ function captureSecrets(res: Response) {
   }
   const scnt = res.headers.get("scnt");
   if (scnt) session.scnt = scnt;
-  const aaspCookie = (res.headers.getSetCookie?.() ?? []).find((c) =>
-    c.includes("aasp="),
-  );
-  if (aaspCookie) session.aasp = aaspCookie.split("aasp=")[1].split(";")[0];
+  captureAuthCookies(res);
 }
 
 function mfaHeaders(): Record<string, string> {
@@ -327,12 +348,65 @@ function mfaHeaders(): Record<string, string> {
     ...AUTH_HEADERS,
     scnt: session.scnt ?? "",
     "X-Apple-ID-Session-Id": session.sessionId ?? "",
-    Cookie: `aasp=${session.aasp ?? ""}`,
+    Cookie: authCookieHeader() || `aasp=${session.aasp ?? ""}`,
   };
 }
 
+// Cookies set on idmsa.apple.com during sign-in (aasp, dslang, …), sent
+// back on subsequent idmsa requests like a browser would.
+const authCookies = new Map<string, string>();
+
+function captureAuthCookies(res: Response) {
+  for (const c of res.headers.getSetCookie?.() ?? []) {
+    const pair = c.split(";")[0];
+    const eq = pair.indexOf("=");
+    if (eq > 0) authCookies.set(pair.slice(0, eq).trim(), pair.slice(eq + 1));
+  }
+  const aasp = authCookies.get("aasp");
+  if (aasp) session.aasp = aasp;
+}
+
+function authCookieHeader(): string {
+  return [...authCookies.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
+}
+
+/** Registers an OAuth "authorize" session with Apple — the same GET the
+ *  icloud.com sign-in iframe performs before running SRP. It sets the aasp
+ *  (and friends) cookies on idmsa.apple.com that the rest of the sign-in
+ *  calls are expected to carry; without this prelude, accountLogin only
+ *  returns a reduced cookie set missing X-APPLE-WEBAUTH-TOKEN. */
+async function authorizePrelude(): Promise<void> {
+  const frameId = crypto.randomUUID();
+  const qs = new URLSearchParams({
+    frame_id: frameId,
+    language: "en_US",
+    skVersion: "7",
+    iframeId: frameId,
+    client_id: CLIENT_ID,
+    redirect_uri: ICLOUD_ORIGIN,
+    response_type: "code",
+    response_mode: "web_message",
+    state: frameId,
+    authVersion: "latest",
+  });
+  const res = await fetch(`${AUTH_ENDPOINT}authorize/signin?${qs}`, {
+    headers: { ...AUTH_HEADERS, Accept: "*/*" },
+  });
+  captureAuthCookies(res);
+}
+
 async function accountLogin(): Promise<void> {
-  const res = await fetch(SETUP_ENDPOINT, {
+  if (!session.clientId) session.clientId = crypto.randomUUID();
+  // Webapp-style identification query params — with them the response sets the
+  // full web-session cookie set (17 cookies incl. X-APPLE-WEBAUTH-TOKEN);
+  // without them only a reduced 6-cookie set comes back.
+  const qs = new URLSearchParams({
+    requestId: crypto.randomUUID(),
+    clientBuildNumber: WEBAPP_BUILD,
+    clientMasteringNumber: WEBAPP_BUILD,
+    clientId: session.clientId,
+  });
+  const res = await fetch(`${SETUP_ENDPOINT}?${qs}`, {
     method: "POST",
     headers: DEFAULT_HEADERS,
     body: JSON.stringify({
@@ -344,13 +418,19 @@ async function accountLogin(): Promise<void> {
   if (!res.ok)
     throw new ICloudError(`iCloud accountLogin failed (${res.status}).`);
   setCookiesFrom(res);
-  const data = (await res.json()) as { webservices?: Session["webservices"] };
+  const data = (await res.json()) as {
+    webservices?: Session["webservices"];
+    dsInfo?: { dsid?: string };
+  };
   if (!data.webservices?.premiummailsettings?.url) {
     throw new ICloudError(
       "Signed in, but this account has no Hide My Email service (an active iCloud+ subscription is required).",
     );
   }
   session.webservices = data.webservices;
+  session.dsid = data.dsInfo?.dsid;
+  // A stable pseudo client id, like the icloud.com web app's device identifier.
+  if (!session.clientId) session.clientId = crypto.randomUUID();
   session.phase = "ready";
   await saveSessionCache();
 }
@@ -436,13 +516,16 @@ async function doSignIn(): Promise<"ready" | "mfa"> {
   // May throw PasswordRequiredError (prompt mode) — the UI handles that.
   const password = getPassword();
 
+  // Register the OAuth authorize session before SRP (see authorizePrelude).
+  await authorizePrelude();
+
   session.trustToken = (await secretGet("trust")) ?? undefined;
 
   const auth = new GSASRPAuthenticator(prefs.appleId);
   const init = await auth.getInit();
   const initRes = await fetch(`${AUTH_ENDPOINT}signin/init`, {
     method: "POST",
-    headers: AUTH_HEADERS,
+    headers: { ...AUTH_HEADERS, Cookie: authCookieHeader() },
     body: JSON.stringify(init),
   });
   if (!initRes.ok)
@@ -458,7 +541,7 @@ async function doSignIn(): Promise<"ready" | "mfa"> {
     `${AUTH_ENDPOINT}signin/complete?isRememberMeEnabled=true`,
     {
       method: "POST",
-      headers: AUTH_HEADERS,
+      headers: { ...AUTH_HEADERS, Cookie: authCookieHeader() },
       body: JSON.stringify({
         ...complete,
         rememberMe: true,
@@ -522,7 +605,11 @@ interface RequestContext {
   headers: Record<string, string>;
 }
 
-/** Returns the authenticated context for premiummailsettings calls. */
+/** Returns the authenticated context for premiummailsettings calls.
+ *  Mirrors the webapp's request shape: text/plain content type, a wildcard
+ *  Accept header, and the explicit :443 port stripped from the service URL
+ *  (the default port must not appear in the URL/Host header or Apple's edge
+ *  drops the session cookies). */
 async function getContext(): Promise<RequestContext> {
   if (session.phase !== "ready" || !session.webservices) {
     const result = await signIn();
@@ -531,8 +618,14 @@ async function getContext(): Promise<RequestContext> {
     }
   }
   return {
-    baseUrl: session.webservices!.premiummailsettings.url,
-    headers: { ...DEFAULT_HEADERS, Cookie: session.cookies.join("; ") },
+    baseUrl: session.webservices!.premiummailsettings.url.replace(/:443$/, ""),
+    headers: {
+      "User-Agent": USER_AGENT,
+      Accept: "*/*",
+      "Content-Type": "text/plain",
+      Origin: ICLOUD_ORIGIN,
+      Cookie: cookieHeader(),
+    },
   };
 }
 
@@ -547,7 +640,16 @@ export async function authedFetch(
 ): Promise<Response> {
   const doFetch = async () => {
     const ctx = await getContext();
-    return fetch(`${ctx.baseUrl}${path}`, {
+    // Webapp-style identification query params — required by the HME service
+    // (without them the server 401s with "Missing X-APPLE-WEBAUTH-TOKEN cookie"
+    // even though the session is valid).
+    const qs = new URLSearchParams({
+      clientBuildNumber: WEBAPP_BUILD,
+      clientMasteringNumber: WEBAPP_BUILD,
+    });
+    if (session.clientId) qs.set("clientId", session.clientId);
+    if (session.dsid) qs.set("dsid", session.dsid);
+    return fetch(`${ctx.baseUrl}${path}?${qs}`, {
       method: init.method,
       headers: ctx.headers,
       body: init.body,
