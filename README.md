@@ -37,14 +37,30 @@ and start fresh.
 ### Setup
 
 1. Run either command. On first launch Raycast prompts for preferences.
-2. Enter your **Apple ID** (e.g. `you@icloud.com`) and **Password**.
-3. The first time, you'll be asked for the **6-digit verification code** Apple pushes to
+2. Enter your **Apple ID** (e.g. `you@icloud.com`).
+3. Pick a **Password Storage** mode:
+   - **Store in preferences** *(recommended)* — enter your password once; Raycast
+     encrypts preferences at rest. You'll enter a 2FA code about once a month.
+   - **Prompt on use** — leave the password empty. You type it whenever the cached
+     session (about an hour) has expired; it is used for Apple's SRP sign-in,
+     kept in memory only, and **never written to disk** by this extension.
+4. The first sign-in asks for the **6-digit verification code** Apple pushes to
    your trusted devices. Enter it once; the trust token is saved for ~30 days.
-4. Set **Region → China** if you use an `icloud.com.cn` account.
+5. Set **Region → China** if you use an `icloud.com.cn` account.
 
-> **Security:** your password is stored only in Raycast's encrypted preferences and used
-> solely for Apple's SRP login. The trust token lives in Raycast's local storage. Nothing
-> is sent anywhere except Apple.
+> **Security:** with "Store in preferences", your password lives only in Raycast's
+> encrypted preferences and is used solely for Apple's SRP login — it is never sent
+> to Apple in the clear and never sent anywhere else. In "Prompt on use" mode the
+> extension never persists the password at all. The 2FA trust token and the cached
+> iCloud session are stored in the **macOS login Keychain** (encrypted at rest by
+> macOS), not in plaintext files; pre-existing plaintext values are migrated
+> automatically. **Sign Out (reset 2FA)** in the Search command deletes all of it.
+>
+> **Honest threat model:** this protects against leaking secrets via files —
+> backups, cloud-synced home folders, copied Raycast data directories. It cannot
+> protect against malware already running as your user account, which can read the
+> Keychain and query Raycast like any other app you run. Nothing is sent anywhere
+> except Apple.
 
 ### SRP credit
 

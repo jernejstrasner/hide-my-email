@@ -1,6 +1,10 @@
 import { Client, Hash, Mode, Srp, util } from "@foxt/js-srp";
 import { getPreferenceValues, LocalStorage } from "@raycast/api";
 import crypto from "crypto";
+import { execFile } from "child_process";
+import { promisify } from "util";
+
+const exec = promisify(execFile);
 
 /**
  * Apple ID (SRP) authentication for iCloud, ported from foxt/icloud.js and
@@ -21,10 +25,15 @@ interface ExtensionPreferences {
   appleId: string;
   password: string;
   region: "global" | "china";
+  authStore: "stored" | "prompt";
 }
 
 const prefs = getPreferenceValues<ExtensionPreferences>();
 const CHINA = prefs.region === "china";
+// Prompt mode: the password is never persisted anywhere by this extension.
+// The user types it whenever the cached session has expired; it lives only in
+// this process's memory. The trust token / session cache below make that rare.
+const PROMPT_MODE = prefs.authStore === "prompt";
 
 const CLIENT_ID =
   "d39ba9916b7251055b22c7f910e2ea796ee65e98b2ddecea8f5dde8d9d1a815d";
@@ -69,6 +78,9 @@ const AUTH_HEADERS: Record<string, string> = {
 export class ICloudError extends Error {}
 export class InvalidCredentialsError extends ICloudError {}
 export class InvalidMfaCodeError extends ICloudError {}
+/** Thrown in prompt mode when the cached session has expired and the user
+ *  needs to enter their password (which is never written to disk). */
+export class PasswordRequiredError extends ICloudError {}
 
 // --- SRP-6a (GSA variant) — vendored from foxt/icloud.js iCSRPAuthenticator ---
 
@@ -164,8 +176,88 @@ interface Session {
 }
 
 const session: Session = { phase: "idle", cookies: [] };
-const trustKey = `trust-token:${prefs.appleId.toLowerCase()}`;
-const sessionKey = `session-cache:${prefs.appleId.toLowerCase()}`;
+
+// --- Secret storage (trust token + session cache) ---
+//
+// Secrets live in the macOS login Keychain (encrypted at rest by the OS, and
+// outside Raycast's data directory). If the Keychain is unavailable for any
+// reason we degrade to Raycast LocalStorage, and any pre-hardening plaintext
+// LocalStorage values are migrated to the Keychain on first read.
+
+const KC_SERVICE = "raycast.hide-my-email";
+type SecretKind = "trust" | "session";
+const LEGACY_KEYS: Record<SecretKind, string> = {
+  trust: `trust-token:${prefs.appleId.toLowerCase()}`,
+  session: `session-cache:${prefs.appleId.toLowerCase()}`,
+};
+
+function kcAccount(kind: SecretKind): string {
+  return `${kind}:${prefs.appleId.toLowerCase()}`;
+}
+
+/** Returns the stored secret, or undefined. Checks the Keychain first, then
+ *  falls back to (and migrates) a legacy plaintext LocalStorage value. */
+async function secretGet(kind: SecretKind): Promise<string | undefined> {
+  try {
+    const { stdout } = await exec("security", [
+      "find-generic-password",
+      "-s",
+      KC_SERVICE,
+      "-a",
+      kcAccount(kind),
+      "-w",
+    ]);
+    const value = stdout.trim();
+    if (value) return value;
+  } catch {
+    // Not in the Keychain (or `security` unavailable) — fall through.
+  }
+  const legacy = await LocalStorage.getItem<string>(LEGACY_KEYS[kind]);
+  if (!legacy) return undefined;
+  // Migrate the legacy value into the Keychain; only drop the plaintext copy
+  // if the Keychain write actually succeeded.
+  if (await secretSet(kind, legacy)) {
+    await LocalStorage.removeItem(LEGACY_KEYS[kind]);
+  }
+  return legacy;
+}
+
+/** Stores a secret. Returns true if it went into the Keychain, false if we
+ *  had to degrade to (plaintext) LocalStorage. */
+async function secretSet(kind: SecretKind, value: string): Promise<boolean> {
+  try {
+    await exec("security", [
+      "add-generic-password",
+      "-U",
+      "-s",
+      KC_SERVICE,
+      "-a",
+      kcAccount(kind),
+      "-w",
+      value,
+    ]);
+    return true;
+  } catch {
+    await LocalStorage.setItem(LEGACY_KEYS[kind], value);
+    return false;
+  }
+}
+
+async function secretDelete(kind: SecretKind): Promise<void> {
+  try {
+    await exec("security", [
+      "delete-generic-password",
+      "-s",
+      KC_SERVICE,
+      "-a",
+      kcAccount(kind),
+    ]);
+  } catch {
+    // Already absent.
+  }
+  await LocalStorage.removeItem(LEGACY_KEYS[kind]);
+}
+
 // Reuse a session this long before re-running SRP, to avoid Apple rate-limiting.
 // Staleness within the window is still handled by retry-on-expiry in authedFetch.
 const SESSION_TTL_MS = 60 * 60 * 1000;
@@ -173,7 +265,7 @@ const SESSION_TTL_MS = 60 * 60 * 1000;
 /** Loads cached cookies + webservices so repeat command runs skip SRP entirely. */
 async function loadSessionCache(): Promise<boolean> {
   try {
-    const raw = await LocalStorage.getItem<string>(sessionKey);
+    const raw = await secretGet("session");
     if (!raw) return false;
     const c = JSON.parse(raw) as {
       cookies: string[];
@@ -193,8 +285,8 @@ async function loadSessionCache(): Promise<boolean> {
 }
 
 async function saveSessionCache(): Promise<void> {
-  await LocalStorage.setItem(
-    sessionKey,
+  await secretSet(
+    "session",
     JSON.stringify({
       cookies: session.cookies,
       webservices: session.webservices,
@@ -207,7 +299,7 @@ async function clearSessionCache(): Promise<void> {
   session.phase = "idle";
   session.cookies = [];
   session.webservices = undefined;
-  await LocalStorage.removeItem(sessionKey);
+  await secretDelete("session");
 }
 
 function setCookiesFrom(res: Response) {
@@ -295,18 +387,56 @@ export function signIn(): Promise<"ready" | "mfa"> {
   return signInInFlight;
 }
 
+// In prompt mode the password the user typed for this process. Never persisted.
+let promptPassword: string | undefined;
+
+/** The Apple ID password for this sign-in. In stored mode it comes from
+ *  Raycast's encrypted preferences; in prompt mode from the in-memory value
+ *  captured by signInWithPassword — otherwise PasswordRequiredError is thrown
+ *  so the UI can ask for it. */
+function getPassword(): string {
+  if (PROMPT_MODE) {
+    if (!promptPassword)
+      throw new PasswordRequiredError(
+        "Enter your Apple ID password to continue. It is used only in memory and never stored.",
+      );
+    return promptPassword;
+  }
+  if (!prefs.password) {
+    throw new InvalidCredentialsError(
+      "Add your Apple ID and password in the extension preferences, or set Password Storage to “Prompt on use”.",
+    );
+  }
+  return prefs.password;
+}
+
+/** As signIn(), but supplies the password for prompt mode. The password is
+ *  kept in memory for the lifetime of this command run only (it is needed
+ *  again if the session silently expires mid-run and SRP re-authenticates). */
+export function signInWithPassword(password: string): Promise<"ready" | "mfa"> {
+  if (session.phase === "ready") return Promise.resolve("ready");
+  if (!signInInFlight) {
+    promptPassword = password;
+    signInInFlight = doSignIn().finally(() => {
+      signInInFlight = null;
+    });
+  }
+  return signInInFlight;
+}
+
 async function doSignIn(): Promise<"ready" | "mfa"> {
   if (session.phase === "ready") return "ready";
   // Fast path: reuse a recent session and skip the SRP round-trips entirely.
   if (await loadSessionCache()) return "ready";
-  if (!prefs.appleId || !prefs.password) {
+  if (!prefs.appleId) {
     throw new InvalidCredentialsError(
-      "Add your Apple ID and password in the extension preferences.",
+      "Add your Apple ID in the extension preferences.",
     );
   }
+  // May throw PasswordRequiredError (prompt mode) — the UI handles that.
+  const password = getPassword();
 
-  session.trustToken =
-    (await LocalStorage.getItem<string>(trustKey)) ?? undefined;
+  session.trustToken = (await secretGet("trust")) ?? undefined;
 
   const auth = new GSASRPAuthenticator(prefs.appleId);
   const init = await auth.getInit();
@@ -320,7 +450,7 @@ async function doSignIn(): Promise<"ready" | "mfa"> {
       `Sign-in failed to start (${initRes.status}).`,
     );
   const complete = await auth.getComplete(
-    prefs.password,
+    password,
     (await initRes.json()) as SrpInitResponse,
   );
 
@@ -374,7 +504,7 @@ export async function submitMfa(code: string): Promise<void> {
   if (newSession) session.sessionToken = newSession;
   if (newTrust) {
     session.trustToken = newTrust;
-    await LocalStorage.setItem(trustKey, newTrust);
+    await secretSet("trust", newTrust);
   }
 
   await accountLogin();
@@ -382,7 +512,7 @@ export async function submitMfa(code: string): Promise<void> {
 
 /** Forgets the cached session and trust token (forces a fresh 2FA sign-in). */
 export async function signOut(): Promise<void> {
-  await LocalStorage.removeItem(trustKey);
+  await secretDelete("trust");
   session.trustToken = undefined;
   await clearSessionCache();
 }

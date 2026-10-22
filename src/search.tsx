@@ -199,7 +199,7 @@ function SearchView() {
                   onAction={openExtensionPreferences}
                 />
                 <Action
-                  title="Sign Out (Reset 2FA)"
+                  title="Sign out (Reset 2FA)"
                   icon={Icon.Logout}
                   style={Action.Style.Destructive}
                   onAction={async () => {

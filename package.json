@@ -38,9 +38,28 @@
     {
       "name": "password",
       "title": "Password",
-      "description": "Your Apple ID password. Stored only in Raycast's encrypted preferences and sent only to Apple. You'll enter a 2FA code about once a month.",
+      "description": "Your Apple ID password. Required for 'Store in preferences' mode — Raycast encrypts preferences at rest. Leave empty if you use 'Prompt on use', in which case the password is never written to disk.",
       "type": "password",
-      "required": true
+      "required": false,
+      "placeholder": "only needed for 'Store in preferences' mode"
+    },
+    {
+      "name": "authStore",
+      "title": "Password Storage",
+      "description": "How your Apple ID password is provided. Both modes keep the trust token and session cache in the macOS Keychain.",
+      "type": "dropdown",
+      "required": false,
+      "default": "stored",
+      "data": [
+        {
+          "title": "Store in preferences (recommended)",
+          "value": "stored"
+        },
+        {
+          "title": "Prompt on use — never stored on disk",
+          "value": "prompt"
+        }
+      ]
     },
     {
       "name": "region",
